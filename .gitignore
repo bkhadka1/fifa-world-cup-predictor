@@ -1,0 +1,33 @@
+# Data (too large for git — use DVC or manual download)
+data/raw/
+data/processed/
+data/external/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Model artifacts (optional — uncomment to track with git-lfs instead)
+# models/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
