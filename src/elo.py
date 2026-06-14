@@ -131,15 +131,20 @@ class EloSystem:
         default_elo: float = DEFAULT_ELO,
         home_advantage: float = 100.0,
         decay_factor: float = 0.0,   # 0 = no decay; try 0.05 for light decay
+        seed_ratings: dict[str, float] | None = None,  # override with real-world ELO
     ):
         self.default_elo    = default_elo
         self.home_advantage = home_advantage
         self.decay_factor   = decay_factor
+        self.seed_ratings   = seed_ratings or {}
         self.ratings: dict[str, float] = {}
         self._history: list[dict] = []
 
     def _get(self, team: str) -> float:
-        return self.ratings.get(team, self.default_elo)
+        if team not in self.ratings:
+            # Use seed rating if available, else default
+            return self.seed_ratings.get(team, self.default_elo)
+        return self.ratings[team]
 
     def _decay(self) -> None:
         """Pull all ratings slightly toward the mean (call between tournaments)."""
