@@ -5,7 +5,8 @@ A machine learning pipeline that predicts match outcomes and simulates World Cup
 ## Approach
 
 - **Goals model** — Poisson regression predicts expected goals for each team
-- **Match model** — XGBoost classifies win/draw/loss given team features
+- **Match model** — XGBoost, Random Forest, and Logistic Regression classify win/draw/loss
+- **Ensemble** — weighted average of all models for final predictions
 - **ELO ratings** — custom ELO system built from 30+ years of match history
 - **Monte Carlo simulation** — 100,000 tournament simulations to estimate championship probabilities
 
