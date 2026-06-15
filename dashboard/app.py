@@ -21,9 +21,9 @@ import plotly.express as px
 import joblib
 
 from src.simulate import GROUPS_2026, simulate_match
+from dashboard.train_on_startup import get_or_train_model
 from src.elo import EloSystem
-from src.features import compute_form, FEATURE_COLS
-from src.real_elo import REAL_ELO_2026
+from src.features import compute_form
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -217,10 +217,11 @@ def load_features():
 
 @st.cache_resource
 def load_model():
-    path = os.path.join(os.path.dirname(__file__), "..", "models", "ensemble_model.pkl")
-    if os.path.exists(path):
-        return joblib.load(path)
-    return None
+    try:
+        return get_or_train_model()
+    except Exception as e:
+        st.warning(f"Model unavailable: {e}")
+        return None
 
 
 @st.cache_resource
@@ -485,7 +486,7 @@ with tab1:
         )
         st.plotly_chart(fig_m, use_container_width=True)
     else:
-        st.info("Train the model and generate predictions first to enable the match simulator.")
+        st.info("Run notebooks 01 and 02 to generate ELO ratings and enable the match simulator.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
