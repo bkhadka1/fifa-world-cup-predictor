@@ -24,6 +24,7 @@ from src.simulate import GROUPS_2026, simulate_match
 from dashboard.train_on_startup import get_or_train_model
 from src.elo import EloSystem
 from src.features import compute_form
+from src.real_elo import REAL_ELO_2026
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
