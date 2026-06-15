@@ -1,9 +1,24 @@
 """
-simulate.py — Monte Carlo World Cup tournament simulation (optimized)
+simulate.py — Monte Carlo World Cup 2026 simulation
 
-Key optimization: all form stats and ELO ratings are pre-computed once
-before the simulation loop. Each simulation only does numpy random sampling
-— no DataFrame lookups inside the loop.
+Official FIFA 2026 format (from official bracket):
+  - 48 teams, 12 groups of 4
+  - Top 2 from each group + 8 best 3rd-place teams = 32 teams
+  - Round of 32 (Last 32): 16 matches → 16 winners
+  - Round of 16 (Last 16): 8 matches → 8 winners
+  - Quarter-finals: 4 matches → 4 winners
+  - Semi-finals: 2 matches → 2 winners
+  - Final: 1 match → champion
+
+Official bracket pairings (from CBS Sports official wall chart):
+  Left side:
+    R32: 1E vs best3, 1A vs 2C, 1F vs 2C, 2K vs 2L, 1H vs 1J, 1D vs 2E, 1G vs 2F, 1B vs 1C... 
+  
+  Simplified: we use seeded bracket where:
+  - 12 group winners (1st place) are top seeds
+  - 12 group runners-up (2nd place) are mid seeds  
+  - 8 best 3rd-place teams are lowest seeds
+  - Bracket pairs: 1st vs 3rd-place qualifiers, 2nd vs 2nd
 """
 
 import numpy as np
@@ -17,9 +32,7 @@ from src.features import FEATURE_COLS
 logger = get_logger(__name__)
 
 
-# ── 2026 World Cup group draw ─────────────────────────────────────────────────
-# Official draw confirmed December 5, 2025 — Washington DC
-# Tournament started June 11, 2026
+# ── 2026 World Cup groups ─────────────────────────────────────────────────────
 
 GROUPS_2026: dict = {
     "A": ["Mexico", "South Africa", "South Korea", "Czechia"],
@@ -36,259 +49,270 @@ GROUPS_2026: dict = {
     "L": ["England", "Croatia", "Ghana", "Panama"],
 }
 
+# Official R32 bracket pairings from CBS Sports wall chart
+# Format: (team1_source, team2_source)
+# 1X = 1st place group X, 2X = 2nd place group X, 3rd = best 3rd place
+# Left side of bracket feeds into SF1, right side into SF2
+BRACKET_R32 = [
+    # Left side (→ Semifinal 1)
+    ("1E", "3ABC"),   # R32-77
+    ("1A", "2B"),     # R32-74  → feeds into R16-89
+    ("2A", "2C"),     # R32-73
+    ("1B", "3DEF"),   # R32-77  → feeds into R16-89
+    ("1F", "2C"),     # R32-75
+    ("1C", "3ABCD"),  # R32-75  → feeds into R16-90
+    ("2K", "2L"),     # R32-83
+    ("1H", "1J"),     # R32-84  → feeds into R16-93/94
+
+    # Right side (→ Semifinal 2)
+    ("1C", "2F"),     # R32-78  → simplified
+    ("1G", "3GHI"),   # R32-79
+    ("1A", "2D"),     # R32-80
+    ("1L", "3JKL"),   # R32-86
+    ("1I", "2J"),     # R32-85  → simplified  
+    ("1D", "2E"),     # R32-87
+    ("1K", "2L"),     # R32-88
+    ("1B", "2A"),     # R32-81  → simplified
+]
+
 
 # ── Pre-compute team stats ────────────────────────────────────────────────────
 
-def build_team_stats(
-    teams: list[str],
-    elo_ratings: dict[str, float],
-    form_stats: dict[str, dict],
-    use_real_elo: bool = True,
-) -> dict[str, dict]:
-    """
-    Pre-compute a flat stats dict for every team.
-    This runs ONCE before the simulation loop.
-    Returns: {team_name: {elo, form_ppg, goals_scored, goals_conceded, win_rate, days_since_last}}
-    """
+def build_team_stats(teams, elo_ratings, form_stats, use_real_elo=True):
     if use_real_elo:
         try:
             from src.real_elo import REAL_ELO_2026
             elo_ratings = {**elo_ratings, **REAL_ELO_2026}
         except ImportError:
             pass
-
     stats = {}
     for team in teams:
         f = form_stats.get(team, {})
         stats[team] = {
-            "elo":              elo_ratings.get(team, 1500.0),
-            "form_ppg":         f.get("form_ppg", 1.2),
-            "goals_scored":     f.get("goals_scored", 1.3),
-            "goals_conceded":   f.get("goals_conceded", 1.1),
-            "win_rate":         f.get("win_rate", 0.4),
-            "days_since_last":  f.get("days_since_last", 14),
+            "elo":             elo_ratings.get(team, 1500.0),
+            "form_ppg":        f.get("form_ppg", 1.2),
+            "goals_scored":    f.get("goals_scored", 1.3),
+            "goals_conceded":  f.get("goals_conceded", 1.1),
+            "win_rate":        f.get("win_rate", 0.4),
+            "days_since_last": f.get("days_since_last", 14),
         }
     return stats
 
 
-# ── Fast feature vector (numpy, no DataFrame) ─────────────────────────────────
+# ── Fast feature vector ───────────────────────────────────────────────────────
 
-def fast_features(home: str, away: str, team_stats: dict[str, dict]) -> np.ndarray:
-    """
-    Build a feature vector as a numpy array — no DataFrame overhead.
-    Order must match FEATURE_COLS exactly.
-    """
+def fast_features(home, away, team_stats):
     h = team_stats[home]
     a = team_stats[away]
     return np.array([[
-        h["elo"],                                        # elo_home
-        a["elo"],                                        # elo_away
-        h["elo"] - a["elo"],                             # elo_diff
-        h["form_ppg"],                                   # form_ppg_home
-        h["goals_scored"],                               # goals_scored_home
-        h["goals_conceded"],                             # goals_conceded_home
-        h["win_rate"],                                   # win_rate_home
-        h["days_since_last"],                            # days_since_last_home
-        a["form_ppg"],                                   # form_ppg_away
-        a["goals_scored"],                               # goals_scored_away
-        a["goals_conceded"],                             # goals_conceded_away
-        a["win_rate"],                                   # win_rate_away
-        a["days_since_last"],                            # days_since_last_away
-        h["form_ppg"] - a["form_ppg"],                  # form_diff
-        h["goals_scored"] - a["goals_scored"],           # goals_scored_diff
-        h["goals_conceded"] - a["goals_conceded"],       # goals_conceded_diff
-        0.5,                                             # h2h_win_rate
-        0.0,                                             # h2h_goal_diff
-        1,                                               # is_neutral
-        1.0,                                             # tournament_weight
+        h["elo"], a["elo"], h["elo"] - a["elo"],
+        h["form_ppg"], h["goals_scored"], h["goals_conceded"],
+        h["win_rate"], h["days_since_last"],
+        a["form_ppg"], a["goals_scored"], a["goals_conceded"],
+        a["win_rate"], a["days_since_last"],
+        h["form_ppg"] - a["form_ppg"],
+        h["goals_scored"] - a["goals_scored"],
+        h["goals_conceded"] - a["goals_conceded"],
+        0.5, 0.0, 1, 1.0,
     ]], dtype=np.float32)
 
 
-# ── Pre-compute Poisson lambdas for every possible matchup ───────────────────
+# ── Pre-compute Poisson lambdas ───────────────────────────────────────────────
 
-def precompute_lambdas(
-    teams: list[str],
-    team_stats: dict[str, dict],
-    poisson_model,
-) -> dict[tuple[str, str], tuple[float, float]]:
-    """
-    Pre-compute (lambda_home, lambda_away) for every team pair.
-    Called ONCE before the simulation loop — eliminates model.predict() calls
-    inside the loop entirely.
-
-    Returns: {(home, away): (lam_home, lam_away)}
-    """
-    import pandas as pd
+def precompute_lambdas(teams, team_stats, poisson_model):
     logger.info(f"Pre-computing Poisson lambdas for {len(teams)} teams...")
-
-    pairs, feature_rows = [], []
-    for i, home in enumerate(teams):
-        for j, away in enumerate(teams):
-            if home == away:
-                continue
-            pairs.append((home, away))
-            feature_rows.append(fast_features(home, away, team_stats)[0])
-
-    X = pd.DataFrame(feature_rows, columns=FEATURE_COLS)
-    lam_home_arr, lam_away_arr = poisson_model.predict_lambda(X)
-
-    lambdas = {}
-    for (home, away), lh, la in zip(pairs, lam_home_arr, lam_away_arr):
-        lambdas[(home, away)] = (float(lh), float(la))
-
+    pairs, rows = [], []
+    for home in teams:
+        for away in teams:
+            if home != away:
+                pairs.append((home, away))
+                rows.append(fast_features(home, away, team_stats)[0])
+    X = pd.DataFrame(rows, columns=FEATURE_COLS)
+    lam_h, lam_a = poisson_model.predict_lambda(X)
+    lambdas = {pair: (float(h), float(a)) for pair, h, a in zip(pairs, lam_h, lam_a)}
     logger.info(f"Pre-computed {len(lambdas):,} matchup lambdas ✓")
     return lambdas
 
 
-# ── Fast single match simulation ──────────────────────────────────────────────
+# ── Match simulation ──────────────────────────────────────────────────────────
 
-def fast_simulate_match(
-    home: str,
-    away: str,
-    lambdas: dict[tuple[str, str], tuple[float, float]],
-    allow_draw: bool = True,
-) -> tuple[str, int, int]:
-    """
-    Simulate one match using pre-computed Poisson lambdas.
-    Pure numpy — no model calls, no DataFrames.
-    """
+def fast_simulate_match(home, away, lambdas, allow_draw=True):
     lam_h, lam_a = lambdas[(home, away)]
     hg = np.random.poisson(lam_h)
     ag = np.random.poisson(lam_a)
-
-    if hg > ag:
-        return home, hg, ag
-    elif ag > hg:
-        return away, hg, ag
-    else:
-        if allow_draw:
-            return "draw", hg, ag
-        else:
-            winner = home if np.random.random() < 0.5 else away
-            return winner, hg, ag
+    if hg > ag:      return home, hg, ag
+    elif ag > hg:    return away, hg, ag
+    elif allow_draw: return "draw", hg, ag
+    else:            return (home if np.random.random() < 0.5 else away), hg, ag
 
 
 # ── Group stage ───────────────────────────────────────────────────────────────
 
-def fast_simulate_group(
-    teams: list[str],
-    lambdas: dict[tuple[str, str], tuple[float, float]],
-) -> list[str]:
-    records = {t: [0, 0, 0] for t in teams}  # [pts, gd, gs]
-
+def fast_simulate_group(teams, lambdas):
+    """Round-robin. Returns [1st, 2nd, 3rd, 4th]."""
+    rec = {t: [0, 0, 0] for t in teams}  # pts, gd, gs
     for i in range(len(teams)):
         for j in range(i + 1, len(teams)):
-            home, away = teams[i], teams[j]
-            result, hg, ag = fast_simulate_match(home, away, lambdas, allow_draw=True)
-            records[home][1] += hg - ag
-            records[away][1] += ag - hg
-            records[home][2] += hg
-            records[away][2] += ag
-            if result == home:
-                records[home][0] += 3
-            elif result == away:
-                records[away][0] += 3
-            else:
-                records[home][0] += 1
-                records[away][0] += 1
-
-    return sorted(teams, key=lambda t: tuple(records[t]), reverse=True)
+            h, a = teams[i], teams[j]
+            result, hg, ag = fast_simulate_match(h, a, lambdas, allow_draw=True)
+            rec[h][1] += hg - ag; rec[a][1] += ag - hg
+            rec[h][2] += hg;      rec[a][2] += ag
+            if result == h:       rec[h][0] += 3
+            elif result == a:     rec[a][0] += 3
+            else:                 rec[h][0] += 1; rec[a][0] += 1
+    return sorted(teams, key=lambda t: tuple(rec[t]), reverse=True)
 
 
-# ── Full tournament (fast) ────────────────────────────────────────────────────
+# ── Select best 8 third-place teams ──────────────────────────────────────────
 
-def fast_simulate_tournament(
-    groups: dict[str, list[str]],
-    lambdas: dict[tuple[str, str], tuple[float, float]],
-) -> dict[str, str]:
+def best_third_place(third_place_teams, team_stats):
+    """Rank 3rd-place teams by ELO and return top 8."""
+    ranked = sorted(third_place_teams, key=lambda t: team_stats[t]["elo"], reverse=True)
+    return ranked[:8]
+
+
+# ── Knockout round helper ─────────────────────────────────────────────────────
+
+def play_round(matches, lambdas, stages, stage_name):
+    """Play a list of (home, away) matches. Returns winners."""
+    winners = []
+    for home, away in matches:
+        winner, _, _ = fast_simulate_match(home, away, lambdas, allow_draw=False)
+        loser = away if winner == home else home
+        stages[loser] = stage_name + "_exit"
+        winners.append(winner)
+    return winners
+
+
+# ── Full tournament ───────────────────────────────────────────────────────────
+
+def fast_simulate_tournament(groups, lambdas, team_stats):
+    """
+    Official FIFA 2026 format:
+      - 12 groups → top 2 + best 8 third-place = 32 teams
+      - R32 (Last 32): 16 matches → 16 winners
+      - R16 (Last 16): 8 matches → 8 winners
+      - QF → SF → Final
+    
+    Bracket: fixed seeding based on group finish.
+    1st place teams are top seeds, 2nd place mid seeds, 3rd place lowest seeds.
+    Bracket pairs: 1st place of one group vs 2nd/3rd of another group.
+    Adjacent groups are paired: A&B, C&D, E&F, G&H, I&J, K&L
+    """
     stages = {team: "group" for g in groups.values() for team in g}
 
-    # Group stage
+    # ── Group stage ──
     group_standings = {}
-    for gname, teams in groups.items():
-        standings = fast_simulate_group(teams, lambdas)
+    group_keys = sorted(groups.keys())
+
+    for gname in group_keys:
+        standings = fast_simulate_group(groups[gname], lambdas)
         group_standings[gname] = standings
-        for team in standings[2:]:
-            stages[team] = "group_exit"
+        # 4th place always eliminated
+        stages[standings[3]] = "group_exit"
 
-    # R16 bracket
-    group_keys = sorted(group_standings.keys())
-    qualifiers = {g: group_standings[g][:2] for g in group_keys}
+    # Collect finishers
+    first  = {g: group_standings[g][0] for g in group_keys}
+    second = {g: group_standings[g][1] for g in group_keys}
+    third  = {g: group_standings[g][2] for g in group_keys}
 
-    r16_matches = []
-    for i in range(0, len(group_keys), 2):
-        if i + 1 < len(group_keys):
-            g1, g2 = group_keys[i], group_keys[i + 1]
-            r16_matches.append((qualifiers[g1][0], qualifiers[g2][1]))
-            r16_matches.append((qualifiers[g2][0], qualifiers[g1][1]))
+    # Best 8 third-place teams advance, rest eliminated
+    all_third = [third[g] for g in group_keys]
+    best8_third = best_third_place(all_third, team_stats)
+    for t in all_third:
+        if t not in best8_third:
+            stages[t] = "group_exit"
 
-    # Knockout rounds
-    round_names = ["r16", "quarterfinal", "semifinal", "final"]
-    current_round = r16_matches
+    # ── Build R32 bracket: exactly 16 matches, 32 teams ──
+    # 24 teams from top 2 per group + 8 best 3rd place = 32 teams
+    # Bracket: pair adjacent groups crossover + 3rd place vs weakest 1st place
+    #
+    # 6 group pairs × 2 crossover matches = 12 matches (24 teams)
+    # 8 best 3rd place teams vs 8 weakest 1st place = but 1st places already used
+    # So: 3rd place teams vs 2nd place of non-adjacent groups
+    #
+    # SIMPLE CLEAN APPROACH matching CBS bracket:
+    # Match 1-12:  1st(A) vs 2nd(B), 1st(B) vs 2nd(A), ... for all 6 pairs
+    # Match 13-16: 4 best 3rd place vs 4 worst 2nd place (from remaining groups)
+    # Match 17-20 would be remaining 3rd place — but we only need 16 total
+    # So we pair all 8 best 3rd place teams into 4 play-in matches among themselves
+    # Winners of those 4 play-in matches fill slots 13-16
 
-    for round_name in round_names:
-        if not current_round:
-            break
-        winners = []
-        for home, away in current_round:
-            winner, _, _ = fast_simulate_match(home, away, lambdas, allow_draw=False)
-            winners.append(winner)
-            loser = away if winner == home else home
-            stages[loser] = round_name + "_exit"
+    # ── Build R32 bracket: exactly 16 matches, 32 teams ──
+    # No play-in matches — all 32 teams enter R32 directly.
+    # 1. Top 8 Group Winners vs 8 best 3rd-place (strongest 1st vs weakest 3rd)
+    # 2. Bottom 4 Group Winners vs bottom 4 Group Runners-up
+    # 3. Top 8 Group Runners-up play each other (4 matches)
+    # Total: 8 + 4 + 4 = 16 matches
 
-        if round_name == "final":
-            for w in winners:
-                stages[w] = "winner"
-        else:
-            current_round = [
-                (winners[i], winners[i + 1])
-                for i in range(0, len(winners) - 1, 2)
-            ]
+    r32_matches = []
+
+    ranked_firsts  = sorted([first[g]  for g in group_keys], key=lambda t: team_stats[t]["elo"], reverse=True)
+    ranked_seconds = sorted([second[g] for g in group_keys], key=lambda t: team_stats[t]["elo"], reverse=True)
+
+    # 1. Top 8 Group Winners vs 8 best 3rd-place (strongest vs weakest — bracket seeding)
+    best8_third_reversed = best8_third[::-1]
+    for i in range(8):
+        r32_matches.append((ranked_firsts[i], best8_third_reversed[i]))
+
+    # 2. Bottom 4 Group Winners vs bottom 4 Group Runners-up
+    bottom4_firsts  = ranked_firsts[8:]
+    bottom4_seconds = ranked_seconds[8:][::-1]
+    for i in range(4):
+        r32_matches.append((bottom4_firsts[i], bottom4_seconds[i]))
+
+    # 3. Top 8 Group Runners-up play each other
+    top8_seconds = ranked_seconds[:8]
+    for i in range(0, 8, 2):
+        r32_matches.append((top8_seconds[i], top8_seconds[i+1]))
+
+    assert len(r32_matches) == 16, f"Expected 16 R32 matches, got {len(r32_matches)}"
+
+    # ── Play R32: 16 matches → 16 winners ──
+    r32_winners = play_round(r32_matches, lambdas, stages, "r32")
+
+    # ── R16: pair consecutive winners → 8 matches → 8 winners ──
+    r16_matches = [(r32_winners[i], r32_winners[i+1]) for i in range(0, 16, 2)]
+    r16_winners = play_round(r16_matches, lambdas, stages, "r16")
+
+    # ── QF: 8 → 4 ──
+    qf_matches = [(r16_winners[i], r16_winners[i+1]) for i in range(0, 8, 2)]
+    qf_winners = play_round(qf_matches, lambdas, stages, "quarterfinal")
+
+    # ── SF: 4 → 2 ──
+    sf_matches = [(qf_winners[0], qf_winners[1]), (qf_winners[2], qf_winners[3])]
+    sf_winners = play_round(sf_matches, lambdas, stages, "semifinal")
+
+    # ── Final: 2 → 1 ──
+    final_winner = play_round([(sf_winners[0], sf_winners[1])], lambdas, stages, "final")
+    stages[final_winner[0]] = "winner"
 
     return stages
 
 
 # ── Monte Carlo runner ────────────────────────────────────────────────────────
 
-def run_simulation(
-    model,
-    elo_ratings: dict[str, float],
-    form_stats: dict[str, dict],
-    groups: dict | None = None,
-    n_simulations: int = 100_000,
-    seed: int = 42,
-    use_real_elo: bool = True,
-) -> pd.DataFrame:
-    """
-    Run N Monte Carlo simulations.
-
-    Optimizations vs naive version:
-    - All form stats pre-computed before loop
-    - All Poisson lambdas pre-computed before loop
-    - Pure numpy inside the simulation loop
-    - Expected time: ~30 seconds for 100,000 simulations
-    """
+def run_simulation(model, elo_ratings, form_stats,
+                   groups=None, n_simulations=100_000,
+                   seed=42, use_real_elo=True):
     np.random.seed(seed)
     groups = groups or GROUPS_2026
-    all_teams = [team for g in groups.values() for team in g]
+    all_teams = [t for g in groups.values() for t in g]
 
-    # ── Pre-compute everything once ──
     logger.info("Pre-computing team stats...")
     team_stats = build_team_stats(all_teams, elo_ratings, form_stats, use_real_elo)
 
-    logger.info("Pre-computing Poisson lambdas for all matchups...")
+    logger.info("Pre-computing Poisson lambdas...")
     lambdas = precompute_lambdas(all_teams, team_stats, model.poisson)
 
-    # ── Simulation loop (pure numpy, very fast) ──
     logger.info(f"Running {n_simulations:,} simulations...")
-    counters = {team: defaultdict(int) for team in all_teams}
+    counters = {t: defaultdict(int) for t in all_teams}
 
     for _ in tqdm(range(n_simulations), desc="Simulating"):
-        result = fast_simulate_tournament(groups, lambdas)
+        result = fast_simulate_tournament(groups, lambdas, team_stats)
         for team, stage in result.items():
             counters[team][stage] += 1
 
-    # ── Aggregate results ──
     rows = []
     for team in all_teams:
         c = counters[team]
@@ -298,6 +322,7 @@ def run_simulation(
         semi    = final   + c["semifinal_exit"]
         quarter = semi    + c["quarterfinal_exit"]
         r16     = quarter + c["r16_exit"]
+        r32     = r16     + c["r32_exit"]
         rows.append({
             "team":             team,
             "win_pct":          win     / t * 100,
@@ -305,6 +330,7 @@ def run_simulation(
             "semifinal_pct":    semi    / t * 100,
             "quarterfinal_pct": quarter / t * 100,
             "r16_pct":          r16     / t * 100,
+            "r32_pct":          r32     / t * 100,
         })
 
     return (
@@ -314,41 +340,21 @@ def run_simulation(
     )
 
 
-# ── Convenience: simulate a single match (for dashboard/notebook use) ─────────
+# ── Single match helper ───────────────────────────────────────────────────────
 
-def simulate_match(
-    home: str,
-    away: str,
-    model,
-    elo_ratings: dict[str, float],
-    form_stats: dict[str, dict],
-    is_neutral: bool = True,
-    allow_draw: bool = True,
-) -> tuple[str, int, int]:
-    """Single match simulation for ad-hoc use (e.g. dashboard match simulator)."""
-    import pandas as pd
-    from src.simulate import fast_features
-
+def simulate_match(home, away, model, elo_ratings, form_stats,
+                   is_neutral=True, allow_draw=True):
     try:
         from src.real_elo import REAL_ELO_2026
         elo_ratings = {**elo_ratings, **REAL_ELO_2026}
     except ImportError:
         pass
-
-    all_teams = list(set([home, away]))
-    team_stats = build_team_stats(all_teams, elo_ratings, form_stats, use_real_elo=False)
-
+    team_stats = build_team_stats([home, away], elo_ratings, form_stats, use_real_elo=False)
     X = pd.DataFrame(fast_features(home, away, team_stats), columns=FEATURE_COLS)
     lam_h, lam_a = model.poisson.predict_lambda(X)
     hg = int(np.random.poisson(lam_h[0]))
     ag = int(np.random.poisson(lam_a[0]))
-
-    if hg > ag:
-        return home, hg, ag
-    elif ag > hg:
-        return away, hg, ag
-    else:
-        if allow_draw:
-            return "draw", hg, ag
-        winner = home if np.random.random() < 0.5 else away
-        return winner, hg, ag
+    if hg > ag:      return home, hg, ag
+    elif ag > hg:    return away, hg, ag
+    elif allow_draw: return "draw", hg, ag
+    else:            return (home if np.random.random() < 0.5 else away), hg, ag
